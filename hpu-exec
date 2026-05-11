@@ -1,0 +1,182 @@
+#!/usr/bin/bash
+
+#prereqs
+#create table dba.hpu_unload (domain varchar(32),tabschema varchar(128),tabname varchar(128),
+# hpu_hpu_run_count smallint, hpu_hpu_success_count smallint, hpu_hpu_fail_count smallint
+# spark_hpu_run_count smallint, spark_hpu_success_count smallint,spark_hpu_fail_count smallint )
+
+function2call=$1
+[[ $# -gt 0 ]] && shift
+ARGS="$@"
+
+function getScriptPath
+{
+    OLDDIR=$PWD; DIRNAME=$(dirname $1); ACTUAL_DIR=$( cd ${DIRNAME} && pwd ); cd $OLDDIR; echo $ACTUAL_DIR
+}
+
+export TMPDIR=/tmp
+
+CURRENT_HOST=$( hostname -s )
+BASENAME=$(basename $0)
+SCRIPT_PATH="$(getScriptPath $0)"
+SCRIPT_NAME="${SCRIPT_PATH}/$BASENAME"
+
+OUTPATH=/scratch/f1blue/temp
+PIPEPATH=/tmp
+UNLOAD_PARALLELISM=2
+
+echo $SCRIPT_NAME
+
+function list_hosts             #-- list all physical hosts with logical node numbers
+{
+  db2 -x "
+  db2 \"select substr(HOME_HOST,1,32)HOST,smallint(count(*)) count,rpad(listagg(DB_PARTITION_NUM,',')within group (order by DB_PARTITION_NUM),64)nodes
+    from TABLE(SYSPROC.DB2_GET_INSTANCE_INFO(null,null,null,null,null))
+    group by HOME_HOST"
+  "
+}
+
+function list_data_hosts        # list all nodes info for a given args: <schema table>
+{
+  schema=$1
+  table=$2
+  db2 -x "
+  select distinct substr(HOME_HOST,1,32) from TABLE(SYSPROC.DB2_GET_INSTANCE_INFO(null,null,null,null,null)) where ID in (
+    select DBPARTITIONNUM from SYSCAT.DBPARTITIONGROUPDEF where DBPGNAME in (
+      select DBPGNAME from syscat.tablespaces where TBSPACEID in (
+        select TBSPACEID from syscat.tables where tabschema='${schema}' and tabname='${table}' and TBSPACE is not null
+        union all
+        select TBSPACEID from SYSCAT.DATAPARTITIONS where tabschema='${schema}' and tabname='${table}' limit 1
+      )
+    )
+  );"
+}
+
+function list_data_nodes_info   #-- list all nodes info for a given args: <schema table>
+{
+  schema=$1
+  table=$2
+  db2 -x "
+  select SUBSTR(HOME_HOST,1,32)HOST,smallint(count(*)) count,rpad(listagg(DB_PARTITION_NUM,',')within group (order by DB_PARTITION_NUM),64)nodes
+    from TABLE(SYSPROC.DB2_GET_INSTANCE_INFO(null,null,null,null,null)) where ID in (
+      select DBPARTITIONNUM from SYSCAT.DBPARTITIONGROUPDEF where DBPGNAME in (
+        select DBPGNAME from syscat.tablespaces where TBSPACEID in (
+          select TBSPACEID from syscat.tables where tabschema='${schema}' and tabname='${table}' and TBSPACE is not null
+          union all
+          select TBSPACEID from SYSCAT.DATAPARTITIONS where tabschema='${schema}' and tabname='${table}' limit 1
+        )
+      )
+    ) group by HOME_HOST;"
+}
+
+function list_data_current_nodes  #-- list current node info for a given args: <schema table>
+{
+  schema=$1
+  table=$2
+  db2 -x "
+  select rpad(listagg(DB_PARTITION_NUM,',')within group (order by DB_PARTITION_NUM),64)nodes
+    from TABLE(SYSPROC.DB2_GET_INSTANCE_INFO(null,null,null,null,null)) where ID in (
+      select DBPARTITIONNUM from SYSCAT.DBPARTITIONGROUPDEF where DBPGNAME in (
+        select DBPGNAME from syscat.tablespaces where TBSPACEID in (
+          select TBSPACEID from syscat.tables where tabschema='${schema}' and tabname='${table}' and TBSPACE is not null
+          union all
+          select TBSPACEID from SYSCAT.DATAPARTITIONS where tabschema='${schema}' and tabname='${table}' limit 1
+        )
+      )
+    ) group by HOME_HOST;"
+}
+
+function unload_on_all_nodes     #-- Run hpu on all nodes using ssh in background, args: <schema table>
+{
+  schema=$1
+  table=$2
+  echo "Running $@"
+  for ST in $( db2 -x "select rtrim(tabschema)||'.'||tabname
+                  from syscat.tables where tabschema='${schema}' and tabname='${table}' and type='T'
+                  and (tabschema,tabname) not in (select tabschema,tabname from dba.hpu_unload where hpu_success_count=hpu_run_count)
+                  ")
+  do
+    echo $ST
+    tabschema=$(echo $ST | cut -d . -f1)
+    tabname=$(echo $ST | cut -d . -f2)
+#Check if there are more than 2 unloads are running!
+while true
+do
+    hpu_hpu_run_count=$(db2 -x "select int(count(*)) from dba.hpu_unload where hpu_success_count + hpu_fail_count <> hpu_run_count")
+    echo "hpu_hpu_run_count=$hpu_hpu_run_count"
+    if [[ hpu_hpu_run_count -ge $UNLOAD_PARALLELISM ]]; then
+        echo "Sleeping for 5 mins..."
+        sleep 5
+        continue
+    fi
+    break
+done
+
+db2 -v "delete from dba.hpu_unload where tabschema='${tabschema}' and tabname = '${tabname}'"
+db2 -v "insert into dba.hpu_unload values (null,'${tabschema}','${tabname}',0,0,0,0,0,0)"
+
+for host in $(list_data_hosts $tabschema $tabname)
+do
+    echo $host
+    if [[ "$host" == "$CURRENT_HOST" ]]; then
+        $SCRIPT_NAME unload_on_local_node $tabschema $tabname &
+    else
+        ssh -q $host "$SCRIPT_NAME unload_on_local_node $tabschema $tabname" &
+    fi
+done
+}
+
+function unload_on_local_node  #-- Run hpu unload for a given args: <schema table>
+{
+    echo "Running $0"
+    schema=$1
+    table=$2
+    CURRENT_NODES=$(list_data_current_nodes $schema $table)
+    echo "$CURRENT_NODES"
+    for ST in $( db2 -x "select rtrim(tabschema)||'.'||tabname from syscat.tables where tabschema='${schema}' and tabname = '${table}' and type ='T' with ur" )
+    do
+        tabschema=$(echo $ST | cut -d . -f1)
+        tabname=$(echo $ST | cut -d . -f2)
+        db2 -v "update dba.hpu_unload set hpu_run_count=hpu_run_count+1 where tabschema='${tabschema}' and tabname = '${tabname}'"
+        CURRENT_NODES=$(list_data_current_nodes $tabschema $tabname | awk '{print $1}')
+        echo "$ST  data on $CURRENT_NODES nodes"
+        OUTFILE="${OUTPATH}/${ST}-${CURRENT_HOST} | tr '.' '_' ".gz"
+        PIPEFILE="${PIPEPATH}/${ST}-${CURRENT_HOST} | tr '.' '_' ".pipe"
+        echo "OUTFILE=$OUTFILE, PIPEFILE=$PIPEFILE"
+        rm -rf ${PIPEFILE} > /dev/null
+        mkfifo ${PIPEFILE}
+        gzip -c < ${PIPEFILE} > ${OUTFILE} &
+        echo "Unload $ST table to $OUTFILE"
+        echo "
+        GLOBAL CONNECT TO BLUDB DB2 NO QUIESCE NO LOCK NO;
+        UNLOAD TABLESPACE PART( ${CURRENT_NODES} ) SELECT * FROM ${ST};
+        OUTFILE (#${PIPEFILE}# REPLACE)
+        FORMAT DELIMITED MODIFIED BY COLDEL '^'; " | sed "s/#/\"/g" | db2hpu -i db2inst1 -f stdin
+        RC=$?
+        echo "RC=$RC"
+        if [[ $RC -eq 0 ]]; then
+            db2 -v "update dba.hpu_unload set hpu_success_count=hpu_success_count+1 where tabschema='${tabschema}' and tabname like '${tabname}'"
+        else
+            db2 -v "update dba.hpu_unload set hpu_fail_count=hpu_fail_count+1 where tabschema='${tabschema}' and tabname like '${tabname}'"
+        fi
+    done
+}
+
+function show_hpu_proc        #-- Show running hpu unload process across physical nodes
+{
+    filter=${1:-${BASENAME}}
+    for H in $(list_hosts "-x" | awk '{print $1}'); do
+        echo $H;
+        ssh -q $H "ps -ef | grep -Ev 'grep|show_hpu_proc' | grep -i ${filter}"
+    done
+}
+
+#Main
+echo "ARGS: $ARGS"
+if [[ -z "$function2call" ]]; then
+    grep "^function" $SCRIPT_NAME | grep "#--" | sed 's/function //g'
+else
+    $function2call $ARGS
+fi
+exit $?
+
