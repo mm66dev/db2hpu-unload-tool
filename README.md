@@ -1,6 +1,6 @@
 # hpu-exec
 
-A high-performance unload script for extracting DB2 DPF (Data Partitioning Feature) data directly from outside the DB2 engine in MPP (Massively Parallel Processing) environments.
+A high-performance unload script for extracting DB2 DPF (Data Partitioning Feature) data directly from outside of the DB2 engine in MPP (Massively Parallel Processing) environments to flat .gz files to load into Snowflake environment.
 
 ## Overview
 
